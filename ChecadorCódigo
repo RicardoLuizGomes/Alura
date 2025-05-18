@@ -1,0 +1,370 @@
+# ... (importações existentes)
+import spacy
+from googleapiclient.discovery import build # Para Google Custom Search API
+from urllib.parse import quote_plus
+# ... (outras importações)
+
+# --- Configuração das Chaves de API e Parâmetros ---
+app.config['NEWS_API_KEY'] = os.getenv('NEWS_API_KEY')
+app.config['GOOGLE_API_KEY'] = os.getenv('GOOGLE_API_KEY') # Chave da API do Google Cloud
+app.config['GOOGLE_CSE_ID_WEB'] = os.getenv('GOOGLE_CSE_ID_WEB') # CX ID para buscas gerais na web
+app.config['GOOGLE_CSE_ID_FACTCHECK'] = os.getenv('GOOGLE_CSE_ID_FACTCHECK') # Opcional, para fact-checkers
+
+# ... (NLP_PT e NewspaperConfig como antes)
+NLP_PT = None
+try:
+    NLP_PT = spacy.load('pt_core_news_sm')
+except OSError:
+    print("Modelo spaCy 'pt_core_news_sm' não encontrado. Execute 'python -m spacy download pt_core_news_sm'")
+
+# --- Funções de API do Google ---
+
+def google_custom_search(query, cx_id, num_results=5, **kwargs):
+    """
+    Realiza uma busca usando a API Google Custom Search.
+    kwargs pode incluir 'siteSearch' para restringir a um domínio.
+    """
+    if not app.config['GOOGLE_API_KEY'] or not cx_id:
+        print("Chave da API do Google ou CX ID não configurados para Custom Search.")
+        return [], "API do Google Custom Search não configurada."
+
+    try:
+        # Cria o serviço da API de busca customizada
+        service = build("customsearch", "v1", developerKey=app.config['GOOGLE_API_KEY'])
+        
+        # Executa a busca
+        result = service.cse().list(
+            q=query,
+            cx=cx_id,
+            num=num_results,
+            lr='lang_pt', # Restringe para resultados em português
+            **kwargs # Passa argumentos adicionais como siteSearch
+        ).execute()
+
+        items = result.get('items', [])
+        # Formata os resultados para um formato consistente
+        formatted_results = []
+        for item in items:
+            formatted_results.append({
+                "title": item.get('title'),
+                "url": item.get('link'),
+                "snippet": item.get('snippet'),
+                "source_display_name": item.get('displayLink') # Domínio da fonte
+            })
+        return formatted_results, None
+    except Exception as e:
+        print(f"Erro na API Google Custom Search: {e}")
+        # Tentar extrair uma mensagem de erro mais específica da API do Google se disponível
+        error_detail = str(e)
+        if hasattr(e, 'content'):
+            try:
+                error_content = e.content.decode('utf-8')
+                import json
+                error_json = json.loads(error_content)
+                if 'error' in error_json and 'message' in error_json['error']:
+                    error_detail = error_json['error']['message']
+            except:
+                pass # Mantém o str(e) se não conseguir parsear
+        return [], f"Erro na API Google Custom Search: {error_detail}"
+
+
+# --- Funções de Deep Research Atualizadas ---
+
+FACT_CHECKING_SITES_DOMAINS = {
+    "Aos Fatos": "aosfatos.org",
+    "Agência Lupa": "piaui.folha.uol.com.br/lupa", # Ou lupa.news se preferir o novo
+    "Estadão Verifica": "estadao.com.br/estadao-verifica", # O blog pode ser politica.estadao.com.br/blogs/estadao-verifica/
+    "Boatos.org": "boatos.org",
+    "e-Farsas": "e-farsas.com",
+    "Projeto Comprova": "projetocomprova.com.br",
+    # Adicionar mais domínios
+}
+
+def search_fact_checking_sites_via_cse(query_text, num_results_per_site=1):
+    """
+    Busca em sites de checagem de fatos usando Google CSE.
+    Se GOOGLE_CSE_ID_FACTCHECK estiver definido, usa ele.
+    Senão, faz buscas individuais com siteSearch em GOOGLE_CSE_ID_WEB.
+    """
+    all_results = []
+    if not query_text:
+        return all_results, None
+
+    print(f"Buscando checagens (via CSE) para: {query_text}")
+
+    specific_cse_id_for_factcheck = app.config.get('GOOGLE_CSE_ID_FACTCHECK')
+
+    if specific_cse_id_for_factcheck:
+        # Se houver um CSE específico para fact-checkers, faz uma busca nele
+        print(f"  Usando CSE específico para Fact-Checkers (ID: {specific_cse_id_for_factcheck})")
+        results, error = google_custom_search(query_text, cx_id=specific_cse_id_for_factcheck, num_results=len(FACT_CHECKING_SITES_DOMAINS) * num_results_per_site)
+        if error:
+            return [], error # Retorna o erro da API
+        for res in results: # Adiciona o nome da agência se o domínio corresponder
+            res['agency'] = next((name for name, domain in FACT_CHECKING_SITES_DOMAINS.items() if domain in res.get('source_display_name', '')), "Agência Desconhecida")
+        all_results.extend(results)
+    else:
+        # Se não houver CSE específico, faz N buscas no CSE geral, uma para cada site de fact-checking
+        if not app.config.get('GOOGLE_CSE_ID_WEB'):
+            return [], "CSE ID para busca na web não configurado para checagem de fatos."
+        print(f"  Usando CSE geral (ID: {app.config['GOOGLE_CSE_ID_WEB']}) com filtro 'siteSearch'")
+        for agency_name, domain in FACT_CHECKING_SITES_DOMAINS.items():
+            site_query = f"{query_text}" # A API do CSE pode não gostar de siteSearch dentro da query principal, então passamos como kwarg
+            print(f"    Buscando em {agency_name} ({domain})")
+            results, error = google_custom_search(site_query, cx_id=app.config['GOOGLE_CSE_ID_WEB'], num_results=num_results_per_site, siteSearch=domain)
+            if error:
+                # Registra o erro mas continua para outras agências
+                print(f"    Erro ao buscar em {agency_name}: {error}")
+                # Adiciona um link de busca manual como fallback para este site
+                manual_search_url = f"https://www.google.com/search?q={quote_plus(f'site:{domain} {query_text}')}"
+                all_results.append({
+                    "agency": agency_name,
+                    "title": f"Erro na busca API - Tente buscar '{query_text}' manualmente em {agency_name}",
+                    "url": manual_search_url,
+                    "snippet": f"Clique para buscar. Erro da API: {error}",
+                    "is_manual_link": True
+                })
+                continue # Pula para a próxima agência
+            for res in results:
+                res['agency'] = agency_name # Adiciona o nome da agência
+            all_results.extend(results)
+
+    return all_results, None
+
+
+def search_google_scholar_link_only(query_text):
+    """
+    Gera APENAS o link para busca manual no Google Scholar.
+    """
+    if not query_text:
+        return []
+    manual_search_url = f"https://scholar.google.com/scholar?hl=pt&q={quote_plus(query_text)}"
+    return [{
+        "title": f"Buscar '{query_text}' no Google Scholar (manualmente)",
+        "url": manual_search_url,
+        "authors": [],
+        "source": "Google Scholar",
+        "snippet": "Clique para realizar a busca no site do Google Scholar.",
+        "is_manual_link": True
+    }]
+
+def find_primary_sources_via_cse(query_text, num_results=3):
+    """
+    Usa Google CSE (configurado para buscar na web) para encontrar potenciais fontes primárias.
+    Prioriza PDFs e sites .gov/.edu.
+    """
+    if not query_text:
+        return [], None
+    if not app.config.get('GOOGLE_CSE_ID_WEB'):
+        return [], "CSE ID para busca na web não configurado para fontes primárias."
+
+    print(f"Buscando fontes primárias (via CSE) para: {query_text}")
+    all_results = []
+    error_messages = []
+
+    # Query 1: Foco em PDFs
+    pdf_query = f"{query_text} filetype:pdf"
+    results_pdf, error_pdf = google_custom_search(pdf_query, cx_id=app.config['GOOGLE_CSE_ID_WEB'], num_results=num_results)
+    if error_pdf: error_messages.append(f"Erro busca PDFs: {error_pdf}")
+    for res in results_pdf:
+        res['type'] = "PDF Documento"
+    all_results.extend(results_pdf)
+
+    # Query 2: Foco em sites governamentais e educacionais
+    gov_edu_query_terms = [
+        f"{query_text} site:.gov.br",
+        f"{query_text} site:.gov", # Genérico .gov
+        f"{query_text} site:.edu.br",
+        f"{query_text} site:.edu"  # Genérico .edu
+    ]
+    # Para evitar muitas chamadas, podemos fazer uma query OR se a API suportar bem,
+    # ou iterar. Iterar é mais seguro para garantir que cada 'siteSearch' funcione.
+    # No CSE, o 'siteSearch' é um parâmetro, não parte da query 'q'.
+    # Vamos fazer uma busca mais genérica e depois filtrar ou destacar,
+    # ou podemos fazer múltiplas chamadas se quisermos garantir a prioridade.
+    # Por simplicidade, fazemos uma busca e o usuário avalia, ou múltiplas pequenas buscas:
+
+    sites_specific_query = f"{query_text} (site:.gov.br OR site:.gov OR site:.edu.br OR site:.edu OR site:.org.br OR site:.org)"
+    results_sites, error_sites = google_custom_search(sites_specific_query, cx_id=app.config['GOOGLE_CSE_ID_WEB'], num_results=num_results)
+    if error_sites: error_messages.append(f"Erro busca sites .gov/.edu: {error_sites}")
+    for res in results_sites:
+        url_lower = res.get('url', '').lower()
+        if ".gov" in url_lower: res['type'] = "Site Governamental"
+        elif ".edu" in url_lower: res['type'] = "Site Educacional"
+        elif ".org" in url_lower: res['type'] = "Site de Organização (.org)"
+        else: res['type'] = "Documento Web"
+    all_results.extend(results_sites)
+
+
+    # Query 3: Buscando por termos como "relatório" ou "estudo"
+    report_study_query = f"relatório {query_text} OR estudo {query_text}"
+    results_rs, error_rs = google_custom_search(report_study_query, cx_id=app.config['GOOGLE_CSE_ID_WEB'], num_results=num_results)
+    if error_rs: error_messages.append(f"Erro busca relatório/estudo: {error_rs}")
+    for res in results_rs:
+        res['type'] = "Potencial Relatório/Estudo"
+    all_results.extend(results_rs)
+
+    # Remove duplicatas baseadas na URL
+    final_results = []
+    seen_urls = set()
+    for item in all_results:
+        if item.get("url") not in seen_urls:
+            final_results.append(item)
+            seen_urls.add(item.get("url"))
+    
+    combined_error = "; ".join(error_messages) if error_messages else None
+    return final_results[:num_results*2], combined_error # Limita o total de resultados
+
+
+# --- Refinamento da Query para Deep Research ---
+def build_deep_research_query(original_title, entities, potential_claims, max_length=100):
+    """
+    Constrói uma query mais elaborada para o Deep Research.
+    Prioriza alegações, depois título + entidades.
+    """
+    query_parts = []
+
+    # 1. Título sempre entra (parcialmente ou completo)
+    if original_title:
+        query_parts.append(original_title.strip())
+
+    # 2. Adicionar entidades chave (ex: Pessoa, Organização, Local)
+    if entities:
+        entity_texts = [ent['text'] for ent in entities if ent['label'] in ['PER', 'ORG', 'LOC', 'GPE', 'EVENT'] and len(ent['text']) > 2]
+        # Pega as primeiras N entidades únicas para não alongar demais
+        unique_entities = []
+        for et in entity_texts:
+            if et not in unique_entities and et.lower() not in original_title.lower(): # Evita redundância com o título
+                unique_entities.append(et)
+        query_parts.extend(unique_entities[:3]) # Adiciona até 3 entidades relevantes
+
+    # 3. Se houver alegações, pode-se tentar usar a primeira (ou mais relevante)
+    #    Mas alegações podem ser longas, então talvez seja melhor focar em título + entidades.
+    #    Para este exemplo, vamos manter título + entidades como base.
+    #    Se uma alegação específica for muito boa, ela poderia substituir o título.
+    #    if potential_claims:
+    #        first_claim = potential_claims[0]
+    #        # Se a alegação for curta e diferente do título, pode ser uma boa query
+    #        if len(first_claim) < 1.5 * len(original_title) and first_claim.lower() not in original_title.lower():
+    #            query_parts = [first_claim] + unique_entities[:2] # Reinicia a query com a alegação
+
+    # Monta a query final, respeitando um comprimento máximo
+    final_query = ""
+    for part in query_parts:
+        if len(final_query) + len(part) + 1 <= max_length:
+            if final_query:
+                final_query += " "
+            final_query += part
+        else:
+            # Se a parte for muito longa para caber, tenta adicionar apenas um pedaço dela
+            remaining_space = max_length - len(final_query) -1
+            if remaining_space > 5: # Adiciona se houver espaço razoável
+                if final_query: final_query += " "
+                final_query += part[:remaining_space-3] + "..." # Indica que foi cortado
+            break
+    
+    # Se a query estiver vazia (ex: título muito curto e sem entidades), usa o título original
+    if not final_query.strip() and original_title:
+        final_query = original_title.strip()[:max_length]
+
+    print(f"Query refinada para Deep Research: '{final_query}'")
+    return final_query.strip()
+
+
+# --- Rota Principal Atualizada ---
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    input_url = None
+    analysis_type = None
+    error_message = None
+    original_content = None
+    news_api_articles = []
+    deep_research_results_payload = {
+        "query_used": "",
+        "entities": [],
+        "potential_claims": [],
+        "fact_checks": [],
+        "academic_articles": [],
+        "primary_sources_found": []
+    }
+    reverse_image_search_urls = {}
+
+    # Checagem de configuração da API do Google no início
+    if not app.config.get('GOOGLE_API_KEY') or not app.config.get('GOOGLE_CSE_ID_WEB'):
+        # Este erro será exibido se o usuário tentar uma ação que dependa dessas chaves
+        # Podemos adicionar uma mensagem mais proeminente no template se quisermos
+        print("ALERTA: GOOGLE_API_KEY ou GOOGLE_CSE_ID_WEB não estão configurados. Funcionalidades de busca avançada serão limitadas.")
+
+
+    if request.method == 'POST':
+        input_url = request.form.get('url')
+        # ... (validação de input_url) ...
+
+        if not input_url:
+            error_message = "Por favor, insira uma URL."
+        else:
+            # ... (lógica de is_image_url como antes) ...
+            if is_image_url(input_url):
+                analysis_type = 'image'
+                reverse_image_search_urls = get_reverse_image_search_links(input_url)
+                # A busca reversa via API do Google (se implementada) usaria o GOOGLE_CSE_ID_WEB
+                # e passaria a image_url para o parâmetro 'q' ou 'imgUrl' se a API suportar.
+            else:
+                analysis_type = 'news'
+                original_content = extract_news_content(input_url)
+
+                if original_content and original_content.get("title"):
+                    # 1. Extrair Entidades e "Alegações"
+                    if original_content.get("text"):
+                        entities, claims_sentences = extract_entities_and_potential_claims(original_content["text"])
+                        deep_research_results_payload["entities"] = entities
+                        deep_research_results_payload["potential_claims"] = claims_sentences
+
+                    # 2. Busca na NewsAPI
+                    news_api_articles, api_err = search_news_api(original_content["title"])
+                    if api_err: error_message = api_err
+
+                    # 3. Construir query para Deep Research
+                    deep_research_query = build_deep_research_query(
+                        original_content["title"],
+                        deep_research_results_payload["entities"],
+                        deep_research_results_payload["potential_claims"]
+                    )
+                    deep_research_results_payload["query_used"] = deep_research_query
+
+                    if deep_research_query:
+                        # 3a. Busca em Agências de Fact-Checking via CSE
+                        fc_results, fc_err = search_fact_checking_sites_via_cse(deep_research_query)
+                        if fc_err:
+                            error_message = f"{error_message or ''}; Erro FactCheck: {fc_err}".strip('; ')
+                        deep_research_results_payload["fact_checks"] = fc_results
+
+                        # 3b. Link para Busca Acadêmica (Google Scholar)
+                        deep_research_results_payload["academic_articles"] = search_google_scholar_link_only(deep_research_query)
+
+                        # 3c. Busca por Fontes Primárias via CSE
+                        ps_results, ps_err = find_primary_sources_via_cse(deep_research_query)
+                        if ps_err:
+                            error_message = f"{error_message or ''}; Erro Fontes Prim.: {ps_err}".strip('; ')
+                        deep_research_results_payload["primary_sources_found"] = ps_results
+                    else:
+                        print("Query para Deep Research não pôde ser construída.")
+
+                elif not original_content:
+                     error_message = "Não foi possível extrair conteúdo da URL da notícia fornecida."
+
+
+    return render_template('index.html',
+                           # ... (passar todas as variáveis como antes)
+                           input_url=input_url,
+                           analysis_type=analysis_type,
+                           error_message=error_message,
+                           original_content=original_content,
+                           news_api_articles=news_api_articles,
+                           deep_research_results=deep_research_results_payload,
+                           google_image_search_url=reverse_image_search_urls.get('google_images'),
+                           tineye_search_url=reverse_image_search_urls.get('tineye'),
+                           config=app.config # Passar config para o template para condicionais
+                           )
+
+# ... (if __name__ == '__main__': como antes)
